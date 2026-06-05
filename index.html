@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Neuroevolução F1 - Algoritmo Genético</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #2c3e50;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: white;
+            user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        #ui-top {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            display: flex;
+            gap: 20px;
+            z-index: 10;
+        }
+        .btn-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .btn-group h4 { margin: 0 0 5px 0; font-size: 14px; color: #f39c12; }
+        button {
+            background: #34495e;
+            color: white;
+            border: 1px solid #7f8c8d;
+            padding: 5px 10px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: 0.2s;
+        }
+        button:hover { background: #2980b9; }
+        button.active { background: #e74c3c; font-weight: bold; }
+        
+        #hud-bottom {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: right;
+            border-left: 5px solid #e74c3c;
+            z-index: 10;
+        }
+        #hud-bottom h2 { margin: 0; font-size: 32px; font-family: monospace; }
+        #hud-bottom p { margin: 5px 0 0 0; color: #bdc3c7; }
+
+        #stats {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: right;
+            pointer-events: none;
+        }
+        #stats p { margin: 2px 0; font-family: monospace; font-size: 14px; }
+        
+        #controls-help {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.6);
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-top">
+        <div class="btn-group">
+            <h4>Modo</h4>
+            <button id="btn-manual" class="active" onclick="setMode('manual')">Manual</button>
+            <button id="btn-train" onclick="setMode('train')">Treinar (GA)</button>
+            <button id="btn-race" onclick="setMode('race')">Corrida (Melhor)</button>
+        </div>
+        <div class="btn-group">
+            <h4>Pista</h4>
+            <button id="btn-pista0" class="active" onclick="setTrack(0)">Pista 1 (Monza)</button>
+            <button id="btn-pista1" onclick="setTrack(1)">Pista 2 (Interlagos)</button>
+            <button id="btn-pista2" onclick="setTrack(2)">Pista 3 (Oval)</button>
+        </div>
+        <div class="btn-group">
+            <h4>Ações</h4>
+            <button onclick="saveBest()">Salvar Modelo</button>
+            <button onclick="resetModel()">Apagar Memória</button>
+            <button onclick="toggleTurbo()" id="btn-turbo">Turbo: OFF</button>
+        </div>
+    </div>
+
+    <div id="stats">
+        <p id="stat-gen">Geração: 1</p>
+        <p id="stat-alive">Vivos: 0 / 200</p>
+        <p id="stat-best">Melhor Fitness: 0</p>
+    </div>
+
+    <div id="controls-help">
+        [W/A/S/D] Dirigir | [Espaço] Freio de Mão<br>
+        [Scroll] Zoom in/out | [Max 3x]
+    </div>
+
+    <div id="hud-bottom">
+        <h2 id="hud-speed">0 km/h</h2>
+        <p id="hud-gear">Marcha: N</p>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * =========================================================
+ * CONFIGURAÇÕES GERAIS E CONSTANTES
+ * =========================================================
+ */
+const WORLD_SIZE = 3000;
+const TRACK_WIDTH = 125; // 30% + 20% do original (aprox 80 -> 125)
+const CAR_WIDTH = 12;    // -40% do tamanho normal
+const CAR_HEIGHT = 24;
+const POPULATION_SIZE = 200;
+const MAX_SPEED = 18;    // Representa ~100 no HUD
+const ACCEL = 18 / 240;  // 0 a 100 em ~4s (240 frames a 60fps)
+const BRAKE = 0.3;
+const MAX_ZOOM = 3.0;
+const MIN_ZOOM = 0.4;
+const SENSOR_LENGTH = 180;
+const MUTATION_RATE = 0.04;
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+// Canvas oculto para máscara de colisão (Raymarching)
+const maskCanvas = document.createElement('canvas');
+maskCanvas.width = WORLD_SIZE;
+maskCanvas.height = WORLD_SIZE;
+const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+let maskData = null; // Uint8ClampedArray
+
+// Variáveis de Estado
+let mode = 'manual'; // manual, train, race
+let currentTrackIdx = 0;
+let zoom = 1.0;
+let turboMode = false;
+let camera = { x: WORLD_SIZE/2, y: WORLD_SIZE/2 };
+let generation = 1;
+let trackRotationCounter = 0;
+
+// Inputs Manuais
+const keys = { w:false, a:false, s:false, d:false, space:false };
+window.addEventListener('keydown', e => {
+    if(e.key.toLowerCase() === 'w') keys.w = true;
+    if(e.key.toLowerCase() === 'a') keys.a = true;
+    if(e.key.toLowerCase() === 's') keys.s = true;
+    if(e.key.toLowerCase() === 'd') keys.d = true;
+    if(e.code === 'Space') keys.space = true;
+});
+window.addEventListener('keyup', e => {
+    if(e.key.toLowerCase() === 'w') keys.w = false;
+    if(e.key.toLowerCase() === 'a') keys.a = false;
+    if(e.key.toLowerCase() === 's') keys.s = false;
+    if(e.key.toLowerCase() === 'd') keys.d = false;
+    if(e.code === 'Space') keys.space = false;
+});
+window.addEventListener('wheel', e => {
+    zoom -= e.deltaY * 0.001;
+    zoom = Math.max(MIN_ZOOM, Math.min(zoom, MAX_ZOOM));
+});
+
+/**
+ * =========================================================
+ * REDE NEURAL (MLP) E ALGORITMO GENÉTICO
+ * =========================================================
+ */
+class NeuralNetwork {
+    // Topologia: 21 (20 sensores + 1 vel) -> 8 -> 2 (volante, acelerador)
+    constructor(layerSizes = [21, 8, 2]) {
+        this.layers = layerSizes;
+        this.weights = [];
+        this.biases = [];
+        
+        for (let i = 1; i < layerSizes.length; i++) {
+            let w = [], b = [];
+            for (let j = 0; j < layerSizes[i]; j++) {
+                let nodeW = [];
+                for (let k = 0; k < layerSizes[i-1]; k++) {
+                    nodeW.push(Math.random() * 2 - 1);
+                }
+                w.push(nodeW);
+                b.push(Math.random() * 2 - 1);
+            }
+            this.weights.push(w);
+            this.biases.push(b);
+        }
+    }
+
+    predict(inputs) {
+        let current = inputs;
+        for (let i = 0; i < this.weights.length; i++) {
+            let next = [];
+            for (let j = 0; j < this.weights[i].length; j++) {
+                let sum = this.biases[i][j];
+                for (let k = 0; k < current.length; k++) {
+                    sum += current[k] * this.weights[i][j][k];
+                }
+                // Função de ativação Tangente Hiperbólica (saídas -1 a 1)
+                next.push(Math.tanh(sum));
+            }
+            current = next;
+        }
+        return current;
+    }
+
+    clone() {
+        let clone = new NeuralNetwork(this.layers);
+        clone.weights = JSON.parse(JSON.stringify(this.weights));
+        clone.biases = JSON.parse(JSON.stringify(this.biases));
+        return clone;
+    }
+
+    mutate(rate) {
+        for (let i = 0; i < this.weights.length; i++) {
+            for (let j = 0; j < this.weights[i].length; j++) {
+                for (let k = 0; k < this.weights[i][j].length; k++) {
+                    if (Math.random() < rate) {
+                        this.weights[i][j][k] += (Math.random() * 2 - 1) * 0.5;
+                    }
+                }
+                if (Math.random() < rate) {
+                    this.biases[i][j] += (Math.random() * 2 - 1) * 0.5;
+                }
+            }
+        }
+    }
+
+    static crossover(net1, net2) {
+        let child = net1.clone();
+        for (let i = 0; i < child.weights.length; i++) {
+            for (let j = 0; j < child.weights[i].length; j++) {
+                // Cruzamento Uniforme
+                for (let k = 0; k < child.weights[i][j].length; k++) {
+                    if (Math.random() < 0.5) child.weights[i][j][k] = net2.weights[i][j][k];
+                }
+                if (Math.random() < 0.5) child.biases[i][j] = net2.biases[i][j];
+            }
+        }
+        return child;
+    }
+}
+
+/**
+ * =========================================================
+ * FÍSICA DO CARRO E SENSORES
+ * =========================================================
+ */
+class Car {
+    constructor(x, y, angle, brain = null) {
+        this.x = x;
+        this.y = y;
+        this.angle = angle;
+        
+        this.speed = 0;
+        this.drift = 0; 
+        
+        this.dead = false;
+        this.fitness = 0;
+        this.checkpointsPassed = 0;
+        this.lastCheckpointIdx = 0;
+        this.framesAlive = 0;
+        this.timeSinceLastCheckpoint = 0;
+
+        this.brain = brain || new NeuralNetwork();
+        this.sensors = new Array(20).fill(1); // 1 = longe, 0 = batida
+    }
+
+    update(trackPath) {
+        if (this.dead) return;
+        this.framesAlive++;
+        this.timeSinceLastCheckpoint++;
+
+        let steer = 0;
+        let throttle = 0;
+        let brakeForce = false;
+        let handbrake = false;
+
+        if (mode === 'manual') {
+            if (keys.w) throttle = 1;
+            if (keys.s) brakeForce = true;
+            if (keys.a) steer = -1;
+            if (keys.d) steer = 1;
+            if (keys.space) handbrake = true;
+        } else {
+            // IA Controlando
+            let inputs = [...this.sensors, this.speed / MAX_SPEED];
+            let outputs = this.brain.predict(inputs);
+            
+            steer = outputs[0]; // -1 a 1
+            // Output[1] = -1 a 1. Mapeando para 0 a 1 (acelerador) ou freio
+            if (outputs[1] > 0) throttle = outputs[1];
+            else brakeForce = true;
+        }
+
+        // FÍSICA DE ACELERAÇÃO E FRENAGEM
+        if (throttle > 0) {
+            this.speed += ACCEL * throttle;
+        } else {
+            // Atrito natural
+            this.speed -= 0.05;
+        }
+
+        if (brakeForce) this.speed -= BRAKE;
+        if (handbrake) {
+            this.speed -= BRAKE * 1.5;
+            this.drift = 0.5; // Efeito visual de zerinho/patinada
+        } else {
+            this.drift = 0;
+        }
+
+        // Limites de velocidade (Sem Ré)
+        if (this.speed < 0) this.speed = 0;
+        if (this.speed > MAX_SPEED) this.speed = MAX_SPEED;
+
+        // FÍSICA DE ESTERÇAMENTO
+        // Curvas mais fechadas em baixa velocidade, mas requer movimento
+        if (this.speed > 0.5) {
+            let turnFactor = (1.5 - (this.speed / MAX_SPEED)) * 0.08; 
+            if (handbrake) turnFactor *= 2.0; // Zerinho
+            this.angle += steer * turnFactor;
+        }
+
+        // Movimento vetorial
+        this.x += Math.cos(this.angle) * this.speed;
+        this.y += Math.sin(this.angle) * this.speed;
+
+        // UPDATE SENSORES
+        this.updateSensors();
+
+        // COLISÃO: Checa os 4 cantos do carro no maskData
+        if (this.checkCollision()) {
+            this.dead = true;
+            this.speed = 0;
+        }
+
+        // FITNESS E CHECKPOINTS
+        this.updateFitness(trackPath);
+
+        // Aplica a regra de inatividade para o treino e para a corrida (tudo que não for manual)
+        if (mode !== 'manual' && (this.timeSinceLastCheckpoint > 180 || (this.framesAlive > 60 && this.speed < 0.2))) {
+            this.dead = true;
+        }
+    }
+
+    updateSensors() {
+        let startAngle = this.angle - Math.PI / 2; // -90 graus
+        let angleStep = Math.PI / 19; // 180 graus dividido em 19 intervalos (20 raios)
+
+        for (let i = 0; i < 20; i++) {
+            let a = startAngle + i * angleStep;
+            let dist = 0;
+            let hit = false;
+            
+            // Raymarching: avança de 5 em 5 pixels
+            while (dist < SENSOR_LENGTH) {
+                let rx = Math.floor(this.x + Math.cos(a) * dist);
+                let ry = Math.floor(this.y + Math.sin(a) * dist);
+                
+                if (rx < 0 || rx >= WORLD_SIZE || ry < 0 || ry >= WORLD_SIZE || isOffTrack(rx, ry)) {
+                    hit = true;
+                    break;
+                }
+                dist += 5;
+            }
+            this.sensors[i] = dist / SENSOR_LENGTH; // Normalizado 0 a 1
+        }
+    }
+
+    checkCollision() {
+        let cosA = Math.cos(this.angle);
+        let sinA = Math.sin(this.angle);
+        let hw = CAR_WIDTH / 2;
+        let hh = CAR_HEIGHT / 2;
+
+        let corners = [
+            { x: this.x + cosA*hh - sinA*hw, y: this.y + sinA*hh + cosA*hw },
+            { x: this.x + cosA*hh + sinA*hw, y: this.y + sinA*hh - cosA*hw },
+            { x: this.x - cosA*hh - sinA*hw, y: this.y - sinA*hh + cosA*hw },
+            { x: this.x - cosA*hh + sinA*hw, y: this.y - sinA*hh - cosA*hw }
+        ];
+
+        for (let pt of corners) {
+            let px = Math.floor(pt.x);
+            let py = Math.floor(pt.y);
+            if (px < 0 || px >= WORLD_SIZE || py < 0 || py >= WORLD_SIZE) return true;
+            if (isOffTrack(px, py)) return true;
+        }
+        return false;
+    }
+
+    updateFitness(trackPath) {
+        // Encontra o checkpoint mais próximo
+        let minDist = Infinity;
+        let closestIdx = this.lastCheckpointIdx;
+        
+        // Procura nos próximos 20 pontos para não inverter a pista
+        for (let i = 1; i <= 20; i++) {
+            let idx = (this.lastCheckpointIdx + i) % trackPath.length;
+            let pt = trackPath[idx];
+            let d = Math.hypot(this.x - pt.x, this.y - pt.y);
+            if (d < minDist) {
+                minDist = d;
+                closestIdx = idx;
+            }
+        }
+
+        if (minDist < 100 && closestIdx !== this.lastCheckpointIdx) {
+            this.lastCheckpointIdx = closestIdx;
+            this.checkpointsPassed++;
+            this.timeSinceLastCheckpoint = 0;
+            this.fitness = this.checkpointsPassed * 10;
+        }
+    }
+
+    draw(ctx, drawSensors = false) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.angle + this.drift);
+
+        // Corpo do carro
+        ctx.fillStyle = this.dead ? '#7f8c8d' : (mode === 'manual' || mode === 'race' ? '#e74c3c' : '#3498db');
+        ctx.fillRect(-CAR_HEIGHT/2, -CAR_WIDTH/2, CAR_HEIGHT, CAR_WIDTH);
+        
+        // Detalhe para mostrar a frente do carro
+        ctx.fillStyle = '#f1c40f';
+        ctx.fillRect(CAR_HEIGHT/2 - 4, -CAR_WIDTH/2, 4, CAR_WIDTH);
+        
+        ctx.restore();
+
+        // Desenhar sensores
+        if (drawSensors && !this.dead) {
+            let startAngle = this.angle - Math.PI / 2;
+            let angleStep = Math.PI / 19;
+            ctx.strokeStyle = 'rgba(46, 204, 113, 0.4)';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < 20; i++) {
+                let a = startAngle + i * angleStep;
+                let len = this.sensors[i] * SENSOR_LENGTH;
+                ctx.beginPath();
+                ctx.moveTo(this.x, this.y);
+                ctx.lineTo(this.x + Math.cos(a)*len, this.y + Math.sin(a)*len);
+                ctx.stroke();
+                
+                // Ponto vermelho se detectar algo
+                if (this.sensors[i] < 1) {
+                    ctx.fillStyle = 'red';
+                    ctx.beginPath();
+                    ctx.arc(this.x + Math.cos(a)*len, this.y + Math.sin(a)*len, 2, 0, Math.PI*2);
+                    ctx.fill();
+                }
+            }
+        }
+    }
+}
+
+/**
+ * =========================================================
+ * GERAÇÃO DE PISTAS E MÁSCARA (ASPHALT MASK)
+ * =========================================================
+ */
+const TRACK_DEFINITIONS = [
+    // Pista 1: Monza (Retas longas, curvas fechadas)
+    [{x:500,y:500}, {x:2500,y:500}, {x:2500,y:1500}, {x:500,y:1500}],
+    // Pista 2: Interlagos (Mais sinuosa)
+    [{x:1500,y:400}, {x:2600,y:800}, {x:2200,y:2200}, {x:800,y:2000}, {x:400,y:1000}],
+    // Pista 3: Oval com obstaculos
+    [{x:600,y:600}, {x:2400,y:600}, {x:2400,y:1400}, {x:1500,y:1200}, {x:1500,y:1800}, {x:600,y:1800}]
+];
+
+let currentSpline = [];
+let obstacles = [];
+
+function catmullRom(p0, p1, p2, p3, t) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    return {
+        x: 0.5 * ((2*p1.x) + (-p0.x+p2.x)*t + (2*p0.x-5*p1.x+4*p2.x-p3.x)*t2 + (-p0.x+3*p1.x-3*p2.x+p3.x)*t3),
+        y: 0.5 * ((2*p1.y) + (-p0.y+p2.y)*t + (2*p0.y-5*p1.y+4*p2.y-p3.y)*t2 + (-p0.y+3*p1.y-3*p2.y+p3.y)*t3)
+    };
+}
+
+function generateTrackSpline(waypoints) {
+    let spline = [];
+    let segments = 60; // Pontos por curva
+    for (let i = 0; i < waypoints.length; i++) {
+        let p0 = waypoints[(i - 1 + waypoints.length) % waypoints.length];
+        let p1 = waypoints[i];
+        let p2 = waypoints[(i + 1) % waypoints.length];
+        let p3 = waypoints[(i + 2) % waypoints.length];
+
+        for (let t = 0; t < 1; t += 1/segments) {
+            spline.push(catmullRom(p0, p1, p2, p3, t));
+        }
+    }
+    return spline;
+}
+
+function generateObstacles(spline) {
+    obstacles = [];
+    // Adiciona obstáculos encostados nas bordas (esquerda ou direita alternando)
+    for (let i = 20; i < spline.length; i += 80) {
+        let pt = spline[i];
+        let nextPt = spline[(i+1)%spline.length];
+        let dx = nextPt.x - pt.x;
+        let dy = nextPt.y - pt.y;
+        let len = Math.hypot(dx, dy);
+        let nx = -dy / len;
+        let ny = dx / len;
+        
+        // Alterna entre borda interna e externa
+        let side = (i % 160 === 20) ? 1 : -1;
+        
+        // Raio do obstáculo 20. Distancia do centro = Largura/2 - Raio
+        let distFromCenter = (TRACK_WIDTH / 2) - 20; 
+        
+        obstacles.push({
+            x: pt.x + nx * distFromCenter * side,
+            y: pt.y + ny * distFromCenter * side,
+            radius: 20
+        });
+    }
+}
+
+function drawTrackMask() {
+    maskCtx.fillStyle = 'black'; // Off-track (Grama)
+    maskCtx.fillRect(0, 0, WORLD_SIZE, WORLD_SIZE);
+
+    // Desenhar Asfalto (Branco puro)
+    maskCtx.strokeStyle = 'white';
+    maskCtx.lineWidth = TRACK_WIDTH;
+    maskCtx.lineJoin = 'round';
+    maskCtx.lineCap = 'round';
+    
+    maskCtx.beginPath();
+    maskCtx.moveTo(currentSpline[0].x, currentSpline[0].y);
+    for (let i = 1; i <= currentSpline.length; i++) {
+        let p = currentSpline[i % currentSpline.length];
+        maskCtx.lineTo(p.x, p.y);
+    }
+    maskCtx.stroke();
+
+    // Desenhar Obstáculos (Preto puro - funciona como off-track)
+    maskCtx.fillStyle = 'black';
+    for (let obs of obstacles) {
+        maskCtx.beginPath();
+        maskCtx.arc(obs.x, obs.y, obs.radius, 0, Math.PI*2);
+        maskCtx.fill();
+    }
+
+    // Extrair os pixels para colisão rápida (ehAsfalto)
+    maskData = maskCtx.getImageData(0, 0, WORLD_SIZE, WORLD_SIZE).data;
+}
+
+function isOffTrack(x, y) {
+    if (x < 0 || x >= WORLD_SIZE || y < 0 || y >= WORLD_SIZE) return true;
+    let index = (y * WORLD_SIZE + x) * 4;
+    // Pista é branca (r=255, g=255, b=255). Qualquer coisa < 128 é obstáculo/grama.
+    return maskData[index] < 128; 
+}
+
+function drawVisualTrack(ctx) {
+    // Grama
+    ctx.fillStyle = '#27ae60';
+    ctx.fillRect(0, 0, WORLD_SIZE, WORLD_SIZE);
+
+    // Asfalto
+    ctx.strokeStyle = '#34495e';
+    ctx.lineWidth = TRACK_WIDTH;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(currentSpline[0].x, currentSpline[0].y);
+    for (let i = 1; i <= currentSpline.length; i++) {
+        let p = currentSpline[i % currentSpline.length];
+        ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    // Linha de chegada paralela (no ponto 0)
+    let p0 = currentSpline[0];
+    let p1 = currentSpline[1];
+    let dx = p1.x - p0.x;
+    let dy = p1.y - p0.y;
+    let len = Math.hypot(dx, dy);
+    let nx = -dy / len;
+    let ny = dx / len;
+    
+    ctx.strokeStyle = '#ecf0f1';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(p0.x + nx * (TRACK_WIDTH/2), p0.y + ny * (TRACK_WIDTH/2));
+    ctx.lineTo(p0.x - nx * (TRACK_WIDTH/2), p0.y - ny * (TRACK_WIDTH/2));
+    ctx.stroke();
+
+    // Obstáculos
+    for (let obs of obstacles) {
+        ctx.fillStyle = '#c0392b'; // Vermelho vivo
+        ctx.beginPath();
+        ctx.arc(obs.x, obs.y, obs.radius, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    }
+}
+
+/**
+ * =========================================================
+ * GERENCIAMENTO DA POPULAÇÃO (GA)
+ * =========================================================
+ */
+let population = [];
+let bestFitnessOverall = 0;
+
+function initPopulation(brainTemplate = null) {
+    population = [];
+    let startPt = currentSpline[0];
+    let nextPt = currentSpline[1];
+    let startAngle = Math.atan2(nextPt.y - startPt.y, nextPt.x - startPt.x);
+
+    for (let i = 0; i < POPULATION_SIZE; i++) {
+        let brain;
+        if (brainTemplate) {
+            brain = brainTemplate.clone();
+            if (mode !== 'race') {
+                brain.mutate(MUTATION_RATE); 
+            } else {
+                // O primeiro carro (i=0) é o clone perfeito, os outros têm micro-mutações
+                if (i > 0) brain.mutate(0.01); 
+            }
+        } else {
+            brain = new NeuralNetwork();
+        }
+        
+        // Spawn em grid pequeno perto da largada
+        let offsetX = (Math.random() - 0.5) * 40;
+        let offsetY = (Math.random() - 0.5) * 40;
+        
+        population.push(new Car(startPt.x + offsetX, startPt.y + offsetY, startAngle, brain));
+    }
+}
+
+function nextGeneration() {
+    // Avalia fitness
+    population.sort((a, b) => b.fitness - a.fitness);
+    let bestBrain = population[0].brain.clone();
+    
+    if (population[0].fitness > bestFitnessOverall) {
+        bestFitnessOverall = population[0].fitness;
+    }
+
+    let newPopBrains = [];
+    
+    // Elitismo: Mantém os 10% melhores intocados
+    const eliteCount = Math.floor(POPULATION_SIZE * 0.1);
+    for (let i = 0; i < eliteCount; i++) {
+        newPopBrains.push(population[i].brain.clone());
+    }
+
+    // Seleção por Torneio para o restante
+    for (let i = eliteCount; i < POPULATION_SIZE; i++) {
+        let parentA = tournamentSelection();
+        let parentB = tournamentSelection();
+        let childBrain = NeuralNetwork.crossover(parentA, parentB);
+        childBrain.mutate(MUTATION_RATE);
+        newPopBrains.push(childBrain);
+    }
+
+    // Rotação de Pistas a cada 5 gerações para generalização
+    generation++;
+    trackRotationCounter++;
+    if (trackRotationCounter >= 5) {
+        trackRotationCounter = 0;
+        let nextTrack = (currentTrackIdx + 1) % 3;
+        setTrack(nextTrack, false); // false para não resetar pop manual
+    }
+
+    // Recria a população física com os novos cérebros
+    let startPt = currentSpline[0];
+    let nextPt = currentSpline[1];
+    let startAngle = Math.atan2(nextPt.y - startPt.y, nextPt.x - startPt.x);
+
+    population = [];
+    for (let i = 0; i < POPULATION_SIZE; i++) {
+        let offsetX = (Math.random() - 0.5) * 40;
+        let offsetY = (Math.random() - 0.5) * 40;
+        population.push(new Car(startPt.x + offsetX, startPt.y + offsetY, startAngle, newPopBrains[i]));
+    }
+}
+
+function tournamentSelection() {
+    // Pega 5 carros aleatórios e retorna o melhor
+    let best = null;
+    for (let i = 0; i < 5; i++) {
+        let randomCar = population[Math.floor(Math.random() * population.length)];
+        if (!best || randomCar.fitness > best.fitness) best = randomCar;
+    }
+    return best.brain;
+}
+
+/**
+ * =========================================================
+ * UI & CONTROLE DE FLUXO
+ * =========================================================
+ */
+function setTrack(idx, resetPop = true) {
+    currentTrackIdx = idx;
+    
+    // Atualiza Botões UI
+    for(let i=0; i<3; i++) {
+        document.getElementById('btn-pista'+i).classList.remove('active');
+    }
+    document.getElementById('btn-pista'+idx).classList.add('active');
+
+    // Gera Spline, Obstáculos e Máscara
+    currentSpline = generateTrackSpline(TRACK_DEFINITIONS[idx]);
+    generateObstacles(currentSpline);
+    drawTrackMask();
+
+    if (resetPop) {
+        if (mode === 'manual') {
+            initPopulation(null);
+            population.splice(1); // Deixa só 1
+        } else if (mode === 'train') {
+            initPopulation(null); // Recomeça treino aleatório ao forçar troca manual
+            generation = 1;
+            bestFitnessOverall = 0;
+            trackRotationCounter = 0;
+        } else if (mode === 'race') {
+            let saved = localStorage.getItem('bestF1Model');
+            if (saved) {
+                let brain = new NeuralNetwork();
+                Object.assign(brain, JSON.parse(saved));
+                initPopulation(brain);
+            } else {
+                alert("Nenhum modelo treinado salvo! Vá para o modo Treinar primeiro.");
+                setMode('manual');
+            }
+        }
+    }
+}
+
+function setMode(newMode) {
+    mode = newMode;
+    document.getElementById('btn-manual').classList.remove('active');
+    document.getElementById('btn-train').classList.remove('active');
+    document.getElementById('btn-race').classList.remove('active');
+    document.getElementById('btn-' + mode).classList.add('active');
+
+    turboMode = false;
+    document.getElementById('btn-turbo').innerText = "Turbo: OFF";
+
+    setTrack(currentTrackIdx, true);
+}
+
+function toggleTurbo() {
+    if (mode !== 'train') return;
+    turboMode = !turboMode;
+    document.getElementById('btn-turbo').innerText = "Turbo: " + (turboMode ? "ON" : "OFF");
+}
+
+function saveBest() {
+    if (population.length > 0) {
+        // Pega o melhor vivo ou o melhor geral da rodada
+        let sorted = [...population].sort((a,b) => b.fitness - a.fitness);
+        let best = sorted[0].brain;
+        localStorage.setItem('bestF1Model', JSON.stringify(best));
+        alert("Melhor rede neural salva com sucesso! Você pode usar no modo Corrida em qualquer pista.");
+    }
+}
+
+function resetModel() {
+    localStorage.removeItem('bestF1Model');
+    alert("Memória apagada.");
+    if (mode === 'race') setMode('manual');
+}
+
+/**
+ * =========================================================
+ * LOOP PRINCIPAL DE JOGO (UPDATE & DRAW)
+ * =========================================================
+ */
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function update() {
+    let cycles = turboMode ? 50 : 1; // Avanço rápido no modo turbo
+
+    for (let c = 0; c < cycles; c++) {
+        let allDead = true;
+        let activeCars = 0;
+
+        for (let car of population) {
+            car.update(currentSpline);
+            if (!car.dead) {
+                allDead = false;
+                activeCars++;
+            }
+        }
+
+        // Condição de troca de geração (Treino) ou reset (Manual/Race)
+        if (allDead) {
+            if (mode === 'train') {
+                nextGeneration();
+            } else if (mode === 'race') {
+                // Apenas respawna os carros sem reconstruir a pista pesada
+                let saved = localStorage.getItem('bestF1Model');
+                if (saved) {
+                    let brain = new NeuralNetwork();
+                    Object.assign(brain, JSON.parse(saved));
+                    initPopulation(brain);
+                }
+            } else {
+                initPopulation(null);
+                population.splice(1);
+            }
+        }
+
+        if (!turboMode) {
+            document.getElementById('stat-alive').innerText = `Vivos: ${activeCars} / ${population.length}`;
+            let currentBest = Math.max(...population.map(p => p.fitness));
+            document.getElementById('stat-best').innerText = `Melhor Fitness: ${Math.max(currentBest, bestFitnessOverall)}`;
+            document.getElementById('stat-gen').innerText = `Geração: ${generation}`;
+        }
+    }
+}
+
+function draw() {
+    // 1. Atualizar a Câmera focando no melhor carro
+    let bestCar = population[0];
+    if (mode === 'manual') {
+        bestCar = population[0]; // Só tem 1
+    } else {
+        // Encontra o carro vivo que está mais avançado
+        let maxFit = -1;
+        for (let car of population) {
+            if (!car.dead && car.fitness > maxFit) {
+                maxFit = car.fitness;
+                bestCar = car;
+            }
+        }
+        if (!bestCar) bestCar = population[0]; // Fallback se todos mortos
+    }
+
+    if (bestCar) {
+        // Lerp Suave da Câmera
+        camera.x += (bestCar.x - camera.x) * 0.1;
+        camera.y += (bestCar.y - camera.y) * 0.1;
+    }
+
+    // 2. Limpar a tela
+    ctx.fillStyle = '#2c3e50';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 3. Aplicar Transformações
+    ctx.save();
+    ctx.translate(canvas.width / 2, canvas.height / 2);
+    ctx.scale(zoom, zoom);
+    ctx.translate(-camera.x, -camera.y);
+
+    // 4. Desenhar Pista e Obstáculos
+    drawVisualTrack(ctx);
+
+    // 5. Desenhar Carros
+    // Desenha carros mortos por baixo
+    for (let car of population) {
+        if (car.dead) car.draw(ctx, false);
+    }
+    // Desenha carros vivos por cima, com sensores
+    for (let car of population) {
+        if (!car.dead) {
+            // Desenha os raios apenas para o carro "foco" para não poluir demais a tela no treino
+            let isFocus = (car === bestCar);
+            car.draw(ctx, isFocus); 
+        }
+    }
+
+    ctx.restore();
+
+    // 6. Atualizar HUD de Velocidade (Baseado no melhor carro ou carro manual)
+    if (bestCar) {
+        // Calcula km/h fictício (MaxSpeed 18 => ~180 km/h)
+        let speedKmh = Math.floor(Math.abs(bestCar.speed) * 10); 
+        let gear = speedKmh === 0 ? 'N' : Math.ceil(speedKmh / 35);
+        if (gear > 6) gear = 6;
+        
+        document.getElementById('hud-speed').innerText = `${speedKmh} km/h`;
+        document.getElementById('hud-gear').innerText = `Marcha: ${gear}`;
+    }
+}
+
+function gameLoop() {
+    update();
+    draw();
+    requestAnimationFrame(gameLoop);
+}
+
+// Inicialização
+setMode('manual');
+gameLoop();
+
+</script>
+</body>
+</html>
